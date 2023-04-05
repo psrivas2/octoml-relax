@@ -128,7 +128,7 @@ def get_cuda_target() -> tvm.target.Target:
     # Otherwise, query nvidia-smi to learn which gpu this is.
     gpu_info = subprocess.check_output("nvidia-smi -q", shell=True).decode()
     product_pattern = r"Product Name\s+:\s+(.*)"
-    product_name = re.search(product_pattern, gpu_info).group(1).strip("NVIDIA").strip()
+    product_name = re.search(product_pattern, gpu_info).group(1).strip()
 
     # TVM contains prebuilt targets for most GPUs, we need only create a mapping between the
     # official product name and the corresponding target.
