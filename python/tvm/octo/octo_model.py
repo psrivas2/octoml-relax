@@ -178,7 +178,7 @@ class OctoModel(object):
             outputs = [outputs.numpy()]
         return outputs
 
-    def profile(self) -> tvm.runtime.profiling.Report:
+    def profile(self, filename: str = None) -> tvm.runtime.profiling.Report:
         """Measures the model's performance.
 
         Returns
@@ -196,3 +196,7 @@ class OctoModel(object):
         )("main")
         print(report)
         print(timing_result)
+        if filename:
+            with open(filename, "w") as fopen:
+                fopen.write(report.table())
+
