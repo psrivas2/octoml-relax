@@ -22,7 +22,7 @@ from typing import Union, Optional, Dict, List
 import onnx
 import onnx_graphsurgeon as gs
 import tvm
-from tvm import relax
+from tvm import relax, meta_schedule as ms
 from tvm.relax.frontend.onnx import from_onnx
 from tvm.relax.backend.contrib.cutlass import partition_for_cutlass
 from tvm.relax.transform.tuning_api import Trace
@@ -116,6 +116,63 @@ def offload_cutlass(mod: tvm.IRModule, target: tvm.target.Target) -> tvm.IRModul
     mod = cutlass_codegen_pass(mod)
     return mod
 
+def dump_func(mod: tvm.IRModule, name: str):
+    print("\n---- ", name, " ----")
+    print(mod[name].script())
+
+
+def schedule_func(primfunc: tvm.tir.PrimFunc, target: tvm.target.Target) -> Union[tvm.tir.PrimFunc, None]:
+    """Apply some basic optimizations on the PrimFunc. 
+    
+    For example, for GPUs we apply AutoBind, AutoInline, CrossThreadReduction,
+    InlineConstantScalars, ParallelizeVectorizeUnroll
+
+    Parameters
+    ----------
+    primfunc : tvm.tir.PrimFunc
+        The input primfunc.
+    target : tvm.target.Target
+        The target used for compilation. Needed to generate design space.
+
+    Returns
+    -------
+    optimized_primfunc : Union[tvm.tir.PrimFunc, None]
+        The primfunc is applying some basic optimizations by picking a
+        random candidate from the design space. Returns None if the picked
+        candidate fails compilation.
+
+    """
+    mod = tvm.IRModule({"main": primfunc})
+    sch_rules = ms.ScheduleRule.create(target.kind.name)
+    spaces = ms.TuneContext(
+            mod=mod,
+            target=target,
+            space_generator=ms.space_generator.PostOrderApply(
+                sch_rules=sch_rules,
+                postprocs=[],
+                mutator_probs={},
+            ),
+            task_name="main",
+        ).generate_design_space()
+    if len(spaces) == 0:
+        print ("No valid candidate for PrimFunc: ", primfunc.script())
+        return None
+    # randomly pick up the last candidate from design space
+    # anecdotally the last candidate puts intermediate buffers in shared memory
+    space = spaces[-1]
+    mod = space.mod
+    # verify that the valid candidate can be successfully compiled
+    # should we run verify_gpu_code pass?
+    # This only fails for some already scheduled cumsum operations in space_v5 but
+    # leaving it here as a safety net.
+    try:
+        _ = relax.build(mod, target)
+    except:
+        print("Unable to build func ", primfunc.script())
+        return None
+    
+    return mod["main"]
+
 
 def compile(
     model: Union[str, Path, onnx.ModelProto],
@@ -205,6 +262,18 @@ def compile(
     relax_mod = relax.transform.FuseOps()(relax_mod)
     relax_mod = relax.transform.FuseTIR()(relax_mod)
 
+    print_funcs = ["softmax"]
+    for n in print_funcs:
+        dump_func(relax_mod, n)
+
+    # Apply some basic optimizations for scheduling on GPU
+    if target.kind.name == "cuda":
+        for gv, func in relax_mod.functions.items():
+            if isinstance(func, tvm.tir.PrimFunc):
+                updated_func = schedule_func(func, target)
+                if updated_func:
+                    relax_mod[gv] = updated_func.with_attrs({"tir.is_scheduled": True})
+    
     # If specified, perform tuning to optimize remaining workloads.
     if work_dir is None:
         work_dir = tempfile.mkdtemp()
@@ -225,6 +294,9 @@ def compile(
     if target.kind.name == "cuda":
         with target, tvm.transform.PassContext(opt_level=3):
             relax_mod = tvm.tir.transform.DefaultGPUSchedule()(relax_mod)
+
+    for n in print_funcs:
+        dump_func(relax_mod, n)
 
     # Compile the module.
     exe = relax.build(relax_mod, target)
